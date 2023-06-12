@@ -1,4 +1,7 @@
-use std::io::{StdoutLock, Write};
+use std::{
+    collections::HashMap,
+    io::{StdoutLock, Write},
+};
 
 // use std::collections::HashMap;
 use anyhow::{bail, Context};
@@ -44,6 +47,18 @@ enum Payload {
         #[serde(rename = "id")]
         unq_id: String,
     },
+    Broadcast {
+        message: usize,
+    },
+    BroadcastOk,
+    Read,
+    ReadOk {
+        messages: Vec<usize>,
+    },
+    Topology {
+        topology: HashMap<String, Vec<String>>,
+    },
+    TopologyOk,
 }
 
 // State machines
@@ -52,7 +67,12 @@ struct EchoNode {
 }
 
 impl EchoNode {
-    pub fn step(&mut self, input: Message, output: &mut StdoutLock) -> anyhow::Result<()> {
+    pub fn step(
+        &mut self,
+        input: Message,
+        output: &mut StdoutLock,
+        broadcast_store: &mut BroadcastStore,
+    ) -> anyhow::Result<()> {
         match input.body.payload {
             Payload::Init { .. } => {
                 let reply = Message {
@@ -99,10 +119,75 @@ impl EchoNode {
                 output.write_all(b"\n").context("trailing new line")?;
                 self.id += 1;
             }
-            Payload::InitOk | Payload::GenerateOk { .. } => bail!("Oks should never happen"),
+            Payload::Broadcast { message } => {
+                broadcast_store.messages.push(message);
+                let reply = Message {
+                    src: input.dest,
+                    dest: input.src,
+                    body: MessageBody {
+                        msg_id: Some(self.id),
+                        in_reply_to: input.body.msg_id,
+                        payload: Payload::BroadcastOk,
+                    },
+                };
+                serde_json::to_writer(&mut *output, &reply).context("Serialize Init response")?;
+                output.write_all(b"\n").context("trailing new line")?;
+                self.id += 1;
+            }
+            Payload::Read => {
+                let reply = Message {
+                    src: input.dest,
+                    dest: input.src,
+                    body: MessageBody {
+                        msg_id: Some(self.id),
+                        in_reply_to: input.body.msg_id,
+                        payload: Payload::ReadOk {
+                            messages: broadcast_store.messages.clone(),
+                        },
+                    },
+                };
+                serde_json::to_writer(&mut *output, &reply).context("Serialize Init response")?;
+                output.write_all(b"\n").context("trailing new line")?;
+                self.id += 1;
+            }
+            Payload::Topology { topology } => {
+                broadcast_store.topology = topology;
+                let reply = Message {
+                    src: input.dest,
+                    dest: input.src,
+                    body: MessageBody {
+                        msg_id: Some(self.id),
+                        in_reply_to: input.body.msg_id,
+                        payload: Payload::TopologyOk,
+                    },
+                };
+                serde_json::to_writer(&mut *output, &reply).context("Serialize Init response")?;
+                output.write_all(b"\n").context("trailing new line")?;
+                self.id += 1;
+            }
+            Payload::InitOk
+            | Payload::GenerateOk { .. }
+            | Payload::BroadcastOk { .. }
+            | Payload::ReadOk { .. }
+            | Payload::TopologyOk => {
+                bail!("Oks should never happen")
+            }
             _ => {}
         }
         Ok(())
+    }
+}
+
+struct BroadcastStore {
+    messages: Vec<usize>,
+    topology: HashMap<String, Vec<String>>,
+}
+impl Default for BroadcastStore {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            topology: HashMap::new(),
+        }
     }
 }
 
@@ -113,9 +198,12 @@ fn main() -> anyhow::Result<()> {
     let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message>();
 
     let mut state = EchoNode { id: 1 };
+    let mut broadcast_store = BroadcastStore::default();
     for input in inputs {
         let input = input.context("Message input failed to deserealize")?;
-        state.step(input, &mut stdout).context("EchoNode failed")?;
+        state
+            .step(input, &mut stdout, &mut broadcast_store)
+            .context("EchoNode failed")?;
     }
 
     Ok(())
