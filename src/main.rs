@@ -3,6 +3,7 @@ use std::io::{StdoutLock, Write};
 // use std::collections::HashMap;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Message {
@@ -13,20 +14,10 @@ struct Message {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct MessageBody {
-    // #[serde(rename = "type")]
-    // msg_type: String,
     msg_id: Option<usize>,
     in_reply_to: Option<usize>,
-    // // node Initialization
-    // node_id: Option<String>,
-    // node_ids: Option<Vec<String>>,
-    // // errors
-    // code: Option<usize>,
-    // text: Option<String>,
-    // // Others
     #[serde(flatten)]
     payload: Payload,
-    // rest: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -48,6 +39,11 @@ enum Payload {
     EchoOk {
         echo: String,
     },
+    Generate,
+    GenerateOk {
+        #[serde(rename = "id")]
+        unq_id: String,
+    },
 }
 
 // State machines
@@ -56,14 +52,9 @@ struct EchoNode {
 }
 
 impl EchoNode {
-    pub fn step(
-        &mut self,
-        input: Message,
-        output: &mut StdoutLock, // serde_json::Serializer<StdoutLock>,
-    ) -> anyhow::Result<()> {
+    pub fn step(&mut self, input: Message, output: &mut StdoutLock) -> anyhow::Result<()> {
         match input.body.payload {
             Payload::Init { .. } => {
-                // { node_id, node_ids }
                 let reply = Message {
                     src: input.dest,
                     dest: input.src,
@@ -73,7 +64,7 @@ impl EchoNode {
                         payload: Payload::InitOk,
                     },
                 };
-                // Dereference Output so it can be re-borrowed.
+                // Dereference `output` so it can be re-borrowed.
                 serde_json::to_writer(&mut *output, &reply).context("Serialize Init response")?;
                 output.write_all(b"\n").context("trailing new line")?;
                 self.id += 1;
@@ -88,18 +79,28 @@ impl EchoNode {
                         payload: Payload::EchoOk { echo },
                     },
                 };
-                // // This method does not work because of writting
-                // // to buffer does not flush the input and add
-                // // a nee line
-                // reply
-                //     .serialize(output)
-                //     .context("Failed to response to echo")?;
                 serde_json::to_writer(&mut *output, &reply).context("Serialize Echo response")?;
                 output.write_all(b"\n").context("trailing new line")?;
                 self.id += 1;
             }
-            Payload::InitOk { .. } => bail!("InitOk should never happen"),
-            _ => {} // Payload::EchoOk { .. } => {},
+            Payload::Generate { .. } => {
+                let unique_id = Ulid::new();
+                let unique_id = unique_id.to_string();
+                let reply = Message {
+                    src: input.dest,
+                    dest: input.src,
+                    body: MessageBody {
+                        msg_id: Some(self.id),
+                        in_reply_to: input.body.msg_id,
+                        payload: Payload::GenerateOk { unq_id: unique_id },
+                    },
+                };
+                serde_json::to_writer(&mut *output, &reply).context("Serialize Echo response")?;
+                output.write_all(b"\n").context("trailing new line")?;
+                self.id += 1;
+            }
+            Payload::InitOk | Payload::GenerateOk { .. } => bail!("Oks should never happen"),
+            _ => {}
         }
         Ok(())
     }
@@ -110,7 +111,6 @@ fn main() -> anyhow::Result<()> {
     let mut stdout = std::io::stdout().lock();
 
     let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message>();
-    // let mut output = serde_json::Serializer::new(stdout);
 
     let mut state = EchoNode { id: 1 };
     for input in inputs {
