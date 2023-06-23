@@ -23,3 +23,7 @@ Considering you are in /opt within the container
 5 nodes
 
 > maelstrom/maelstrom test -w broadcast --bin ./target/debug/fly_distributed --node-count 5 --time-limit 20 --rate 10
+
+With networks partitions
+
+> maelstrom/maelstrom test -w broadcast --bin ./target/debug/fly_distributed --node-count 5 --time-limit 20 --rate 10 --nemesis partition

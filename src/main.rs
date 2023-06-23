@@ -205,7 +205,33 @@ impl EchoNode {
                 self.id += 1;
             }
             Payload::NodeBroadcast { message } => {
-                broadcast_store.messages.push(message.clone());
+                let exists = broadcast_store.messages.contains(&message);
+                if !exists {
+                    broadcast_store.messages.push(message.clone());
+                    let neighbors = broadcast_store.topology.clone();
+                    let mut neighbors = neighbors.values().flatten().collect::<Vec<&String>>();
+                    neighbors.sort();
+                    neighbors.dedup();
+                    neighbors.retain(|&neighbor| neighbor != &input.dest);
+                    for neighbor in neighbors.into_iter() {
+                        let reply = Message {
+                            src: input.dest.clone(),
+                            dest: String::from(neighbor),
+                            body: MessageBody {
+                                msg_id: Some(self.id),
+                                in_reply_to: input.body.msg_id,
+                                payload: Payload::NodeBroadcast {
+                                    message: message.clone(),
+                                },
+                            },
+                        };
+
+                        serde_json::to_writer(&mut *output, &reply)
+                            .context("Serialize Init response")?;
+                        output.write_all(b"\n").context("trailing new line")?;
+                        self.id += 1;
+                    }
+                }
             }
             Payload::InitOk
             | Payload::GenerateOk { .. }
