@@ -1,6 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{StdoutLock, Write},
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -58,8 +60,8 @@ enum Payload {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk,
-    NodeBroadcast {
-        message: usize,
+    GossipBroadcast {
+        message: Gossiped,
     },
 }
 
@@ -67,17 +69,12 @@ enum Payload {
 struct EchoNode {
     id: usize,
 }
+type Gossiped = HashSet<usize>;
+#[derive(Default, Clone)]
 struct BroadcastStore {
-    messages: Vec<usize>,
-    topology: HashMap<String, Vec<String>>,
-}
-impl Default for BroadcastStore {
-    fn default() -> Self {
-        Self {
-            messages: Vec::new(),
-            topology: HashMap::new(),
-        }
-    }
+    messages: Arc<Mutex<Gossiped>>,
+    whoami: Arc<Mutex<String>>,
+    topology: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl EchoNode {
@@ -90,7 +87,7 @@ impl EchoNode {
         match input.body.payload {
             Payload::Init { .. } => {
                 let reply = Message {
-                    src: input.dest,
+                    src: input.dest.clone(),
                     dest: input.src,
                     body: MessageBody {
                         msg_id: Some(self.id),
@@ -98,6 +95,8 @@ impl EchoNode {
                         payload: Payload::InitOk,
                     },
                 };
+                let mut whoamit = broadcast_store.whoami.lock().unwrap();
+                whoamit.extend(input.dest.clone().chars());
                 // Dereference `output` so it can be re-borrowed.
                 serde_json::to_writer(&mut *output, &reply).context("Serialize Init response")?;
                 output.write_all(b"\n").context("trailing new line")?;
@@ -134,7 +133,9 @@ impl EchoNode {
                 self.id += 1;
             }
             Payload::Broadcast { message } => {
-                broadcast_store.messages.push(message.clone());
+                let broad_store = broadcast_store.clone();
+                let mut broad_msg = broad_store.messages.lock().unwrap();
+                broad_msg.insert(message.clone());
                 let reply = Message {
                     src: input.dest.clone(),
                     dest: input.src,
@@ -148,32 +149,11 @@ impl EchoNode {
                 serde_json::to_writer(&mut *output, &reply).context("Serialize Init response")?;
                 output.write_all(b"\n").context("trailing new line")?;
                 self.id += 1;
-
-                let neighbors = broadcast_store.topology.clone();
-                let mut neighbors = neighbors.values().flatten().collect::<Vec<&String>>();
-                neighbors.sort();
-                neighbors.dedup();
-                neighbors.retain(|&neighbor| neighbor != &input.dest);
-                for neighbor in neighbors.into_iter() {
-                    let reply = Message {
-                        src: input.dest.clone(),
-                        dest: String::from(neighbor),
-                        body: MessageBody {
-                            msg_id: Some(self.id),
-                            in_reply_to: input.body.msg_id,
-                            payload: Payload::NodeBroadcast {
-                                message: message.clone(),
-                            },
-                        },
-                    };
-
-                    serde_json::to_writer(&mut *output, &reply)
-                        .context("Serialize Init response")?;
-                    output.write_all(b"\n").context("trailing new line")?;
-                    self.id += 1;
-                }
             }
             Payload::Read => {
+                let broad_store = broadcast_store.clone();
+                let broad_msg = broad_store.messages.lock().unwrap();
+
                 let reply = Message {
                     src: input.dest,
                     dest: input.src,
@@ -181,7 +161,7 @@ impl EchoNode {
                         msg_id: Some(self.id),
                         in_reply_to: input.body.msg_id,
                         payload: Payload::ReadOk {
-                            messages: broadcast_store.messages.clone(),
+                            messages: broad_msg.clone().into_iter().collect(),
                         },
                     },
                 };
@@ -190,7 +170,9 @@ impl EchoNode {
                 self.id += 1;
             }
             Payload::Topology { topology } => {
-                broadcast_store.topology = topology;
+                let brc_str = broadcast_store.topology.clone();
+                let mut neighbors = brc_str.lock().unwrap();
+                neighbors.extend(topology);
                 let reply = Message {
                     src: input.dest,
                     dest: input.src,
@@ -204,34 +186,10 @@ impl EchoNode {
                 output.write_all(b"\n").context("trailing new line")?;
                 self.id += 1;
             }
-            Payload::NodeBroadcast { message } => {
-                let exists = broadcast_store.messages.contains(&message);
-                if !exists {
-                    broadcast_store.messages.push(message.clone());
-                    let neighbors = broadcast_store.topology.clone();
-                    let mut neighbors = neighbors.values().flatten().collect::<Vec<&String>>();
-                    neighbors.sort();
-                    neighbors.dedup();
-                    neighbors.retain(|&neighbor| neighbor != &input.dest);
-                    for neighbor in neighbors.into_iter() {
-                        let reply = Message {
-                            src: input.dest.clone(),
-                            dest: String::from(neighbor),
-                            body: MessageBody {
-                                msg_id: Some(self.id),
-                                in_reply_to: input.body.msg_id,
-                                payload: Payload::NodeBroadcast {
-                                    message: message.clone(),
-                                },
-                            },
-                        };
-
-                        serde_json::to_writer(&mut *output, &reply)
-                            .context("Serialize Init response")?;
-                        output.write_all(b"\n").context("trailing new line")?;
-                        self.id += 1;
-                    }
-                }
+            Payload::GossipBroadcast { message } => {
+                let broad_store = broadcast_store.clone();
+                let mut broad_msg = broad_store.messages.lock().unwrap();
+                (&mut broad_msg).extend(message);
             }
             Payload::InitOk
             | Payload::GenerateOk { .. }
@@ -246,14 +204,60 @@ impl EchoNode {
 
 fn main() -> anyhow::Result<()> {
     let stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout().lock();
 
     let inputs = serde_json::Deserializer::from_reader(stdin).into_iter::<Message>();
 
     let mut state = EchoNode { id: 1 };
     let mut broadcast_store = BroadcastStore::default();
+
+    let broadcast_thread = broadcast_store.clone();
+    std::thread::spawn(move || -> anyhow::Result<()> {
+        let mut moreids: usize = 1000;
+        loop {
+            {
+                let src;
+                let msgs;
+                {
+                    let xsrc = broadcast_thread.whoami.clone().lock().unwrap().to_string();
+                    let xmsgs = broadcast_thread.messages.lock().unwrap();
+                    src = xsrc.clone();
+                    msgs = xmsgs.clone();
+                }
+                let broad_neighbors = broadcast_thread.topology.clone();
+                let neighbors = broad_neighbors.lock().unwrap();
+                let mut neighbors = neighbors.values().flatten().collect::<Vec<&String>>();
+                neighbors.sort();
+                neighbors.dedup();
+                neighbors.retain(|&neighbor| neighbor != &src);
+                for neighbor in neighbors.into_iter() {
+                    let reply = Message {
+                        src: src.clone(),
+                        dest: String::from(neighbor),
+                        body: MessageBody {
+                            msg_id: Some(moreids),
+                            in_reply_to: None,
+                            payload: Payload::GossipBroadcast {
+                                message: msgs.clone(),
+                            },
+                        },
+                    };
+
+                    let mut output = std::io::stdout().lock();
+                    serde_json::to_writer(&mut output, &reply)
+                        .context("Serialize Init response")?;
+                    output.write_all(b"\n").context("trailing new line")?;
+                    moreids += 1;
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+
     for input in inputs {
         let input = input.context("Message input failed to deserealize")?;
+
+        let mut stdout = std::io::stdout().lock();
         state
             .step(input, &mut stdout, &mut broadcast_store)
             .context("EchoNode failed")?;
